@@ -45,7 +45,7 @@ DEFAULT_LAT_THR = float(os.environ.get("DEFAULT_LATENCY_THRESHOLD_SECONDS", "2.0
 
 DB_URL = "sqlite+aiosqlite:///./telewatch.db"
 TELEGRAM_MSG_LIMIT = 4096
-CHUNK_SIZE = 3800  # keep some headroom for HTML entities
+CHUNK_SIZE = 3800
 
 Base = declarative_base()
 
@@ -102,9 +102,6 @@ def html_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 async def send_dm(application, user_id: int, text: str, use_html: bool = True):
-    """
-    Safe send with HTML parse mode + fallback to plain text if Telegram rejects entities.
-    """
     try:
         await application.bot.send_message(
             chat_id=user_id,
@@ -112,7 +109,6 @@ async def send_dm(application, user_id: int, text: str, use_html: bool = True):
             parse_mode=ParseMode.HTML if use_html else None
         )
     except BadRequest as e:
-        # Fallback: strip HTML and retry once
         log.warning("BadRequest sending message, retrying without HTML: %s", e)
         try:
             stripped = re.sub(r"</?[^>]+>", "", text)
@@ -125,13 +121,9 @@ async def send_dm(application, user_id: int, text: str, use_html: bool = True):
         log.exception("Unexpected error during send")
 
 async def send_long_message(application, user_id: int, text: str):
-    """
-    Chunk long messages to stay under Telegram limits.
-    """
     if len(text) <= TELEGRAM_MSG_LIMIT:
         await send_dm(application, user_id, text)
         return
-    # split on paragraph boundaries if possible
     parts = []
     remaining = text
     while len(remaining) > CHUNK_SIZE:
@@ -144,10 +136,17 @@ async def send_long_message(application, user_id: int, text: str):
     for p in parts:
         await send_dm(application, user_id, p)
 
+def ensure_aware_utc(dt: datetime) -> datetime:
+    if dt is None:
+        return datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
 def next_fire_from(last_trigger_utc: datetime, interval_minutes: int) -> datetime:
     now = datetime.now(timezone.utc)
+    last_trigger_utc = ensure_aware_utc(last_trigger_utc)
     if interval_minutes <= 0:
-        # safety: never schedule <=0
         return now + timedelta(days=365*100)
     if now <= last_trigger_utc:
         return last_trigger_utc
@@ -156,15 +155,7 @@ def next_fire_from(last_trigger_utc: datetime, interval_minutes: int) -> datetim
     return last_trigger_utc + timedelta(minutes=interval_minutes * k)
 
 def parse_utc_timestamp(ts: str) -> datetime:
-    """
-    Accepts:
-      - 2025-09-23T16:10:00Z
-      - 2025-09-23 16:10:00Z
-      - 2025-09-23T16:10:00+00:00  (any offset allowed; converted to UTC)
-    """
-    ts = ts.strip()
-    # Support space instead of T
-    ts = ts.replace(" ", "T")
+    ts = ts.strip().replace(" ", "T")
     if ts.endswith("Z"):
         ts = ts[:-1] + "+00:00"
     dt = datetime.fromisoformat(ts)
@@ -176,7 +167,7 @@ def valid_url(u: str) -> bool:
     return u.startswith("http://") or u.startswith("https://")
 
 # -------------------------
-# Job functions (wrapped)
+# Job functions
 # -------------------------
 
 async def run_alarm(application, alarm_id: int):
@@ -201,24 +192,21 @@ async def run_endpoint_check(application, endpoint_id: int):
             )).scalar_one_or_none()
             if not ep or not ep.enabled:
                 return
-
             try:
                 async with httpx.AsyncClient(timeout=ep.timeout_seconds, follow_redirects=True) as client:
                     start = datetime.now(timezone.utc)
                     resp = await client.get(ep.url)
                     elapsed = (datetime.now(timezone.utc) - start).total_seconds()
-
                 if resp.status_code >= 400:
                     await send_dm(application, ep.owner_telegram_id,
-                                  f"🚨 <b>API down</b>: <code>{html_escape(ep.url)}</code> returned {resp.status_code}")
+                        f"🚨 <b>API down</b>: <code>{html_escape(ep.url)}</code> returned {resp.status_code}")
                     return
-
                 if elapsed > ep.latency_threshold_seconds:
                     await send_dm(application, ep.owner_telegram_id,
-                                  f"⚠️ <b>Slow</b>: {elapsed:.2f}s (limit {ep.latency_threshold_seconds:.2f}s) for <code>{html_escape(ep.url)}</code>")
+                        f"⚠️ <b>Slow</b>: {elapsed:.2f}s (limit {ep.latency_threshold_seconds:.2f}s) for <code>{html_escape(ep.url)}</code>")
             except httpx.RequestError as e:
                 await send_dm(application, ep.owner_telegram_id,
-                              f"🚨 <b>Unreachable</b>: <code>{html_escape(ep.url)}</code>\n<code>{html_escape(type(e).__name__ + ': ' + str(e))}</code>")
+                    f"🚨 <b>Unreachable</b>: <code>{html_escape(ep.url)}</code>\n<code>{html_escape(type(e).__name__ + ': ' + str(e))}</code>")
     except Exception:
         log.exception("run_endpoint_check failed (endpoint_id=%s)", endpoint_id)
 
@@ -233,10 +221,8 @@ def schedule_alarm_job(alarm: Alarm, app):
         job_id = f"alarm:{alarm.id}"
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
-        scheduler.add_job(
-            run_alarm, trig, args=[app, alarm.id],
-            id=job_id, misfire_grace_time=60, coalesce=True, max_instances=1
-        )
+        scheduler.add_job(run_alarm, trig, args=[app, alarm.id],
+                          id=job_id, misfire_grace_time=60, coalesce=True, max_instances=1)
     except Exception:
         log.exception("schedule_alarm_job failed (alarm_id=%s)", alarm.id)
 
@@ -246,10 +232,8 @@ def schedule_endpoint_job(ep: Endpoint, app):
         job_id = f"endpoint:{ep.id}"
         if scheduler.get_job(job_id):
             scheduler.remove_job(job_id)
-        scheduler.add_job(
-            run_endpoint_check, trig, args=[app, ep.id],
-            id=job_id, misfire_grace_time=60, coalesce=True, max_instances=1
-        )
+        scheduler.add_job(run_endpoint_check, trig, args=[app, ep.id],
+                          id=job_id, misfire_grace_time=60, coalesce=True, max_instances=1)
     except Exception:
         log.exception("schedule_endpoint_job failed (endpoint_id=%s)", ep.id)
 
@@ -275,7 +259,6 @@ def guard(func):
         try:
             user = update.effective_user
             if not user or not is_allowed(user.id):
-                # Silently ignore unauthorized users (personal bot)
                 return
             return await func(update, context)
         except Exception:
@@ -292,13 +275,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 <b>TeleWatch</b>\n"
         "Personal alarms & endpoint checks.\n\n"
         "<b>Commands</b>\n"
-        "/add_alarm \"&lt;message&gt;\" &lt;ISO8601_UTC&gt; &lt;interval_mins&gt;\n"
-        "  e.g. <code>/add_alarm \"Please check 55's network\" 2025-09-23T16:10:00Z 72</code>\n"
-        "/list_alarms, /enable_alarm &lt;id&gt;, /disable_alarm &lt;id&gt;, /delete_alarm &lt;id&gt;\n\n"
-        "/add_endpoint &lt;url&gt; &lt;interval_mins&gt; [timeout=3.0] [latency=2.0]\n"
-        "/list_endpoints, /enable_endpoint &lt;id&gt;, /disable_endpoint &lt;id&gt;, /delete_endpoint &lt;id&gt;\n\n"
-        "/ping — quick reply\n"
-        "/status — backend & scheduler info\n"
+        "/add_alarm \"&lt;msg&gt;\" &lt;UTC_ISO8601&gt; &lt;mins&gt;\n"
+        "/list_alarms, /enable_alarm id, /disable_alarm id, /delete_alarm id\n"
+        "/add_endpoint &lt;url&gt; &lt;mins&gt; [timeout] [latency]\n"
+        "/list_endpoints, /enable_endpoint id, /disable_endpoint id, /delete_endpoint id\n"
+        "/ping — quick reply\n/status — backend health"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -326,26 +307,15 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "⚠️ Failed to collect status."
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
-# ---------- Alarms ----------
+# ---------- Alarm commands ----------
 
 @guard
 async def add_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.strip()
-
-    # Accept:
-    #   /add_alarm "message with spaces" 2025-09-23T16:10:00Z 72
-    #   /add_alarm message 2025-09-23T16:10:00Z 72
-    m = re.match(
-        r'^/add_alarm\s+(?:"([^"]+)"|(\S+))\s+(\S+)\s+(\d+)\s*$',
-        raw
-    )
+    m = re.match(r'^/add_alarm\s+(?:"([^"]+)"|(\S+))\s+(\S+)\s+(\d+)\s*$', raw)
     if not m:
-        await update.message.reply_text(
-            "❌ Usage:\n<code>/add_alarm \"&lt;message&gt;\" 2025-09-23T16:10:00Z 72</code>",
-            parse_mode=ParseMode.HTML,
-        )
+        await update.message.reply_text("❌ Usage:\n<code>/add_alarm \"msg\" 2025-09-23T16:10:00Z 72</code>", parse_mode=ParseMode.HTML)
         return
-
     message = m.group(1) or m.group(2)
     ts_str = m.group(3)
     try:
@@ -353,321 +323,173 @@ async def add_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if interval <= 0:
             raise ValueError
     except Exception:
-        await update.message.reply_text("❌ interval_mins must be a positive integer.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text("❌ interval_mins must be positive integer.", parse_mode=ParseMode.HTML)
         return
-
     try:
         dt = parse_utc_timestamp(ts_str)
     except Exception:
-        await update.message.reply_text(
-            "❌ Invalid timestamp. Use ISO 8601 with timezone, e.g. <code>2025-09-23T16:10:00Z</code>",
-            parse_mode=ParseMode.HTML
-        )
+        await update.message.reply_text("❌ Invalid timestamp. Use e.g. 2025-09-23T16:10:00Z", parse_mode=ParseMode.HTML)
         return
-
     async with AsyncSessionLocal() as session:
-        alarm = Alarm(
-            owner_telegram_id=update.effective_user.id,
-            message=message,
-            last_trigger_utc=dt,
-            interval_minutes=interval,
-            enabled=True,
-        )
+        alarm = Alarm(owner_telegram_id=update.effective_user.id, message=message, last_trigger_utc=dt, interval_minutes=interval, enabled=True)
         session.add(alarm)
         await session.commit()
         await session.refresh(alarm)
-
     schedule_alarm_job(alarm, context.application)
-    await update.message.reply_text(
-        f"✅ Alarm <b>#{alarm.id}</b> added.\nNext: <code>{next_fire_from(alarm.last_trigger_utc, alarm.interval_minutes).isoformat()}</code>",
-        parse_mode=ParseMode.HTML,
-    )
+    await update.message.reply_text(f"✅ Alarm <b>#{alarm.id}</b> added.", parse_mode=ParseMode.HTML)
 
 @guard
 async def list_alarms(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with AsyncSessionLocal() as session:
-        rows = (await session.execute(
-            select(Alarm).where(Alarm.owner_telegram_id == update.effective_user.id).order_by(Alarm.id.asc())
-        )).scalars().all()
-
+        rows = (await session.execute(select(Alarm).where(Alarm.owner_telegram_id == update.effective_user.id))).scalars().all()
     if not rows:
         await update.message.reply_text("No alarms.", parse_mode=ParseMode.HTML)
         return
-
     lines = []
     for a in rows:
         job = scheduler.get_job(f"alarm:{a.id}")
         next_time = job.next_run_time.isoformat() if job and job.next_run_time else "—"
-        lines.append(
-            f"<b>#{a.id}</b> {'✅' if a.enabled else '⏸️'} | every {a.interval_minutes} min | next: <code>{html_escape(next_time)}</code>\n"
-            f"• last: <code>{a.last_trigger_utc.isoformat()}</code>\n"
-            f"• msg: {html_escape(a.message)}"
-        )
+        lines.append(f"<b>#{a.id}</b> {'✅' if a.enabled else '⏸️'} | every {a.interval_minutes} min | next: {next_time}\nmsg: {html_escape(a.message)}")
     await send_long_message(context.application, update.effective_chat.id, "\n\n".join(lines))
 
 @guard
 async def delete_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = update.message.text.strip().split()
     if len(parts) != 2 or not parts[1].isdigit():
-        await update.message.reply_text("Usage: <code>/delete_alarm &lt;id&gt;</code>", parse_mode=ParseMode.HTML)
-        return
+        await update.message.reply_text("Usage: /delete_alarm id", parse_mode=ParseMode.HTML); return
     alarm_id = int(parts[1])
-
     async with AsyncSessionLocal() as session:
-        alarm = (await session.execute(select(Alarm).where(
-            Alarm.id == alarm_id, Alarm.owner_telegram_id == update.effective_user.id
-        ))).scalar_one_or_none()
+        alarm = (await session.execute(select(Alarm).where(Alarm.id==alarm_id, Alarm.owner_telegram_id==update.effective_user.id))).scalar_one_or_none()
         if not alarm:
-            await update.message.reply_text("Not found.", parse_mode=ParseMode.HTML)
-            return
-        await session.delete(alarm)
-        await session.commit()
-
-    job_id = f"alarm:{alarm_id}"
-    try:
-        if scheduler.get_job(job_id):
-            scheduler.remove_job(job_id)
-    except Exception:
-        log.exception("Failed to remove job %s", job_id)
-    await update.message.reply_text(f"🗑️ Deleted alarm <b>#{alarm_id}</b>.", parse_mode=ParseMode.HTML)
-
-async def _toggle_alarm_core(update: Update, enable: bool):
-    parts = update.message.text.strip().split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        cmd = "enable_alarm" if enable else "disable_alarm"
-        await update.message.reply_text(f"Usage: <code>/{cmd} &lt;id&gt;</code>", parse_mode=ParseMode.HTML)
-        return
-    alarm_id = int(parts[1])
-
-    async with AsyncSessionLocal() as session:
-        alarm = (await session.execute(select(Alarm).where(
-            Alarm.id == alarm_id, Alarm.owner_telegram_id == update.effective_user.id
-        ))).scalar_one_or_none()
-        if not alarm:
-            await update.message.reply_text("Not found.", parse_mode=ParseMode.HTML)
-            return
-        alarm.enabled = enable
-        await session.commit()
-
-    try:
-        if enable:
-            schedule_alarm_job(alarm, update.get_application())
-        else:
-            job_id = f"alarm:{alarm_id}"
-            if scheduler.get_job(job_id):
-                scheduler.remove_job(job_id)
-    except Exception:
-        log.exception("Toggle schedule failed for alarm %s", alarm_id)
-
-    await update.message.reply_text(
-        f"{'✅ Enabled' if enable else '⏸️ Disabled'} alarm <b>#{alarm_id}</b>.",
-        parse_mode=ParseMode.HTML,
-    )
+            await update.message.reply_text("Not found.", parse_mode=ParseMode.HTML); return
+        await session.delete(alarm); await session.commit()
+    if scheduler.get_job(f"alarm:{alarm_id}"): scheduler.remove_job(f"alarm:{alarm_id}")
+    await update.message.reply_text(f"🗑️ Deleted alarm #{alarm_id}.", parse_mode=ParseMode.HTML)
 
 @guard
 async def enable_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _toggle_alarm_core(update, True)
+    parts = update.message.text.strip().split()
+    if len(parts)!=2 or not parts[1].isdigit(): await update.message.reply_text("Usage: /enable_alarm id", parse_mode=ParseMode.HTML); return
+    alarm_id=int(parts[1])
+    async with AsyncSessionLocal() as session:
+        alarm=(await session.execute(select(Alarm).where(Alarm.id==alarm_id, Alarm.owner_telegram_id==update.effective_user.id))).scalar_one_or_none()
+        if not alarm: await update.message.reply_text("Not found.", parse_mode=ParseMode.HTML); return
+        alarm.enabled=True; await session.commit()
+    schedule_alarm_job(alarm, context.application)
+    await update.message.reply_text(f"✅ Enabled alarm #{alarm_id}", parse_mode=ParseMode.HTML)
 
 @guard
 async def disable_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _toggle_alarm_core(update, False)
+    parts = update.message.text.strip().split()
+    if len(parts)!=2 or not parts[1].isdigit(): await update.message.reply_text("Usage: /disable_alarm id", parse_mode=ParseMode.HTML); return
+    alarm_id=int(parts[1])
+    async with AsyncSessionLocal() as session:
+        alarm=(await session.execute(select(Alarm).where(Alarm.id==alarm_id, Alarm.owner_telegram_id==update.effective_user.id))).scalar_one_or_none()
+        if not alarm: await update.message.reply_text("Not found.", parse_mode=ParseMode.HTML); return
+        alarm.enabled=False; await session.commit()
+    if scheduler.get_job(f"alarm:{alarm_id}"): scheduler.remove_job(f"alarm:{alarm_id}")
+    await update.message.reply_text(f"⏸️ Disabled alarm #{alarm_id}", parse_mode=ParseMode.HTML)
 
-# ---------- Endpoints ----------
+# ---------- Endpoint commands ----------
 
 @guard
 async def add_endpoint(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /add_endpoint <url> <interval_mins> [timeout] [latency]
-    parts = update.message.text.strip().split()
+    parts=update.message.text.strip().split()
     try:
-        if len(parts) < 3:
-            raise ValueError
-        url = parts[1]
-        if not valid_url(url):
-            raise ValueError("URL must start with http:// or https://")
-        interval = int(parts[2])
-        if interval <= 0:
-            raise ValueError("interval must be > 0")
-        timeout = float(parts[3]) if len(parts) >= 4 else DEFAULT_TIMEOUT
-        if timeout <= 0:
-            raise ValueError("timeout must be > 0")
-        lat_thr = float(parts[4]) if len(parts) >= 5 else DEFAULT_LAT_THR
-        if lat_thr <= 0:
-            raise ValueError("latency must be > 0")
-    except Exception as e:
-        await update.message.reply_text(
-            "❌ Usage:\n<code>/add_endpoint &lt;url&gt; &lt;interval_mins&gt; [timeout=3.0] [latency=2.0]</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        log.warning("add_endpoint parse/validate failed: %s", e)
-        return
-
+        if len(parts)<3: raise ValueError
+        url=parts[1]; interval=int(parts[2]); timeout=float(parts[3]) if len(parts)>=4 else DEFAULT_TIMEOUT; lat=float(parts[4]) if len(parts)>=5 else DEFAULT_LAT_THR
+        if not valid_url(url) or interval<=0 or timeout<=0 or lat<=0: raise ValueError
+    except Exception:
+        await update.message.reply_text("❌ Usage: /add_endpoint https://example.com/health 20 [timeout] [latency]", parse_mode=ParseMode.HTML); return
     async with AsyncSessionLocal() as session:
-        ep = Endpoint(
-            owner_telegram_id=update.effective_user.id,
-            url=url,
-            interval_minutes=interval,
-            timeout_seconds=timeout,
-            latency_threshold_seconds=lat_thr,
-            enabled=True,
-        )
-        session.add(ep)
-        await session.commit()
-        await session.refresh(ep)
-
+        ep=Endpoint(owner_telegram_id=update.effective_user.id,url=url,interval_minutes=interval,timeout_seconds=timeout,latency_threshold_seconds=lat,enabled=True)
+        session.add(ep); await session.commit(); await session.refresh(ep)
     schedule_endpoint_job(ep, context.application)
-    await update.message.reply_text(
-        f"✅ Endpoint <b>#{ep.id}</b> added: <code>{html_escape(url)}</code> every {interval} min",
-        parse_mode=ParseMode.HTML,
-    )
+    await update.message.reply_text(f"✅ Endpoint <b>#{ep.id}</b> added.", parse_mode=ParseMode.HTML)
 
 @guard
 async def list_endpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with AsyncSessionLocal() as session:
-        rows = (await session.execute(
-            select(Endpoint).where(Endpoint.owner_telegram_id == update.effective_user.id).order_by(Endpoint.id.asc())
-        )).scalars().all()
-
-    if not rows:
-        await update.message.reply_text("No endpoints.", parse_mode=ParseMode.HTML)
-        return
-
-    lines = []
+        rows=(await session.execute(select(Endpoint).where(Endpoint.owner_telegram_id==update.effective_user.id))).scalars().all()
+    if not rows: await update.message.reply_text("No endpoints.", parse_mode=ParseMode.HTML); return
+    lines=[]
     for e in rows:
-        job = scheduler.get_job(f"endpoint:{e.id}")
-        next_time = job.next_run_time.isoformat() if job and job.next_run_time else "—"
-        lines.append(
-            f"<b>#{e.id}</b> {'✅' if e.enabled else '⏸️'} | every {e.interval_minutes} min | next: <code>{html_escape(next_time)}</code>\n"
-            f"• timeout={e.timeout_seconds}s | latency={e.latency_threshold_seconds}s\n"
-            f"• url: <code>{html_escape(e.url)}</code>"
-        )
+        job=scheduler.get_job(f"endpoint:{e.id}")
+        next_time=job.next_run_time.isoformat() if job and job.next_run_time else "—"
+        lines.append(f"<b>#{e.id}</b> {'✅' if e.enabled else '⏸️'} | every {e.interval_minutes} min | next: {next_time}\nURL: <code>{html_escape(e.url)}</code>")
     await send_long_message(context.application, update.effective_chat.id, "\n\n".join(lines))
 
 @guard
 async def delete_endpoint(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parts = update.message.text.strip().split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        await update.message.reply_text("Usage: <code>/delete_endpoint &lt;id&gt;</code>", parse_mode=ParseMode.HTML)
-        return
-    endpoint_id = int(parts[1])
-
+    parts=update.message.text.strip().split()
+    if len(parts)!=2 or not parts[1].isdigit(): await update.message.reply_text("Usage: /delete_endpoint id", parse_mode=ParseMode.HTML); return
+    ep_id=int(parts[1])
     async with AsyncSessionLocal() as session:
-        ep = (await session.execute(select(Endpoint).where(
-            Endpoint.id == endpoint_id, Endpoint.owner_telegram_id == update.effective_user.id
-        ))).scalar_one_or_none()
-        if not ep:
-            await update.message.reply_text("Not found.", parse_mode=ParseMode.HTML)
-            return
-        await session.delete(ep)
-        await session.commit()
-
-    job_id = f"endpoint:{endpoint_id}"
-    try:
-        if scheduler.get_job(job_id):
-            scheduler.remove_job(job_id)
-    except Exception:
-        log.exception("Failed to remove job %s", job_id)
-    await update.message.reply_text(f"🗑️ Deleted endpoint <b>#{endpoint_id}</b>.", parse_mode=ParseMode.HTML)
-
-async def _toggle_endpoint_core(update: Update, enable: bool):
-    parts = update.message.text.strip().split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        cmd = "enable_endpoint" if enable else "disable_endpoint"
-        await update.message.reply_text(f"Usage: <code>/{cmd} &lt;id&gt;</code>", parse_mode=ParseMode.HTML)
-        return
-    endpoint_id = int(parts[1])
-
-    async with AsyncSessionLocal() as session:
-        ep = (await session.execute(select(Endpoint).where(
-            Endpoint.id == endpoint_id, Endpoint.owner_telegram_id == update.effective_user.id
-        ))).scalar_one_or_none()
-        if not ep:
-            await update.message.reply_text("Not found.", parse_mode=ParseMode.HTML)
-            return
-        ep.enabled = enable
-        await session.commit()
-
-    try:
-        if enable:
-            schedule_endpoint_job(ep, update.get_application())
-        else:
-            job_id = f"endpoint:{endpoint_id}"
-            if scheduler.get_job(job_id):
-                scheduler.remove_job(job_id)
-    except Exception:
-        log.exception("Toggle schedule failed for endpoint %s", endpoint_id)
-
-    await update.message.reply_text(
-        f"{'✅ Enabled' if enable else '⏸️ Disabled'} endpoint <b>#{endpoint_id}</b>.",
-        parse_mode=ParseMode.HTML,
-    )
+        ep=(await session.execute(select(Endpoint).where(Endpoint.id==ep_id, Endpoint.owner_telegram_id==update.effective_user.id))).scalar_one_or_none()
+        if not ep: await update.message.reply_text("Not found.", parse_mode=ParseMode.HTML); return
+        await session.delete(ep); await session.commit()
+    if scheduler.get_job(f"endpoint:{ep_id}"): scheduler.remove_job(f"endpoint:{ep_id}")
+    await update.message.reply_text(f"🗑️ Deleted endpoint #{ep_id}.", parse_mode=ParseMode.HTML)
 
 @guard
 async def enable_endpoint(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _toggle_endpoint_core(update, True)
+    parts=update.message.text.strip().split()
+    if len(parts)!=2 or not parts[1].isdigit(): await update.message.reply_text("Usage: /enable_endpoint id", parse_mode=ParseMode.HTML); return
+    ep_id=int(parts[1])
+    async with AsyncSessionLocal() as session:
+        ep=(await session.execute(select(Endpoint).where(Endpoint.id==ep_id, Endpoint.owner_telegram_id==update.effective_user.id))).scalar_one_or_none()
+        if not ep: await update.message.reply_text("Not found.", parse_mode=ParseMode.HTML); return
+        ep.enabled=True; await session.commit()
+    schedule_endpoint_job(ep, context.application)
+    await update.message.reply_text(f"✅ Enabled endpoint #{ep_id}", parse_mode=ParseMode.HTML)
 
 @guard
 async def disable_endpoint(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _toggle_endpoint_core(update, False)
+    parts=update.message.text.strip().split()
+    if len(parts)!=2 or not parts[1].isdigit(): await update.message.reply_text("Usage: /disable_endpoint id", parse_mode=ParseMode.HTML); return
+    ep_id=int(parts[1])
+    async with AsyncSessionLocal() as session:
+        ep=(await session.execute(select(Endpoint).where(Endpoint.id==ep_id, Endpoint.owner_telegram_id==update.effective_user.id))).scalar_one_or_none()
+        if not ep: await update.message.reply_text("Not found.", parse_mode=ParseMode.HTML); return
+        ep.enabled=False; await session.commit()
+    if scheduler.get_job(f"endpoint:{ep_id}"): scheduler.remove_job(f"endpoint:{ep_id}")
+    await update.message.reply_text(f"⏸️ Disabled endpoint #{ep_id}", parse_mode=ParseMode.HTML)
 
 # -------------------------
-# Global error handler (last resort)
+# App builder
 # -------------------------
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.exception("Unhandled error", exc_info=context.error)
-    try:
-        # Notify allowed user (if it was a user update)
-        if isinstance(update, Update) and update.effective_user and is_allowed(update.effective_user.id):
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="⚠️ An internal error occurred. Check server logs.",
-            )
-    except Exception:
-        pass
+def build_app() -> Application:
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ping", ping))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("add_alarm", add_alarm))
+    app.add_handler(CommandHandler("list_alarms", list_alarms))
+    app.add_handler(CommandHandler("delete_alarm", delete_alarm))
+    app.add_handler(CommandHandler("enable_alarm", enable_alarm))
+    app.add_handler(CommandHandler("disable_alarm", disable_alarm))
+    app.add_handler(CommandHandler("add_endpoint", add_endpoint))
+    app.add_handler(CommandHandler("list_endpoints", list_endpoints))
+    app.add_handler(CommandHandler("delete_endpoint", delete_endpoint))
+    app.add_handler(CommandHandler("enable_endpoint", enable_endpoint))
+    app.add_handler(CommandHandler("disable_endpoint", disable_endpoint))
+    app.add_handler(MessageHandler(filters.COMMAND, start))  # fallback
+    return app
 
 # -------------------------
-# App bootstrap
+# Main
 # -------------------------
 
-async def on_start(app: Application):
+async def async_main():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     scheduler.start()
+    app = build_app()
     await load_and_schedule_all(app)
     log.info("TeleWatch started.")
-
-def build_app() -> Application:
-    application = ApplicationBuilder().token(BOT_TOKEN).post_init(on_start).build()
-
-    # Core
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", start))
-    application.add_handler(CommandHandler("ping", ping))
-    application.add_handler(CommandHandler("status", status_cmd))
-
-    # Alarms
-    application.add_handler(CommandHandler("add_alarm", add_alarm))
-    application.add_handler(CommandHandler("list_alarms", list_alarms))
-    application.add_handler(CommandHandler("delete_alarm", delete_alarm))
-    application.add_handler(CommandHandler("enable_alarm", enable_alarm))
-    application.add_handler(CommandHandler("disable_alarm", disable_alarm))
-
-    # Endpoints
-    application.add_handler(CommandHandler("add_endpoint", add_endpoint))
-    application.add_handler(CommandHandler("list_endpoints", list_endpoints))
-    application.add_handler(CommandHandler("delete_endpoint", delete_endpoint))
-    application.add_handler(CommandHandler("enable_endpoint", enable_endpoint))
-    application.add_handler(CommandHandler("disable_endpoint", disable_endpoint))
-
-    # Fallback: on any non-command text, show help
-    application.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), start))
-
-    # Global error handler
-    application.add_error_handler(error_handler)
-
-    return application
+    await app.run_polling()
 
 if __name__ == "__main__":
-    app = build_app()
-    # close_loop=False avoids "asyncio loop closed" on systemd restarts
-    app.run_polling(close_loop=False)
+    import asyncio
+    asyncio.run(async_main())
