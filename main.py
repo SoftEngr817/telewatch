@@ -102,6 +102,7 @@ def html_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 async def send_dm(application, user_id: int, text: str, use_html: bool = True):
+    """Safe send with HTML + fallback to plain text."""
     try:
         await application.bot.send_message(
             chat_id=user_id,
@@ -121,6 +122,7 @@ async def send_dm(application, user_id: int, text: str, use_html: bool = True):
         log.exception("Unexpected error during send")
 
 async def send_long_message(application, user_id: int, text: str):
+    """Chunk long messages to stay under Telegram limits."""
     if len(text) <= TELEGRAM_MSG_LIMIT:
         await send_dm(application, user_id, text)
         return
@@ -155,6 +157,7 @@ def next_fire_from(last_trigger_utc: datetime, interval_minutes: int) -> datetim
     return last_trigger_utc + timedelta(minutes=interval_minutes * k)
 
 def parse_utc_timestamp(ts: str) -> datetime:
+    """Accepts 2025-09-23T16:10:00Z, 2025-09-23 16:10:00Z, or with +00:00 offset."""
     ts = ts.strip().replace(" ", "T")
     if ts.endswith("Z"):
         ts = ts[:-1] + "+00:00"
@@ -349,19 +352,25 @@ async def list_alarms(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for a in rows:
         job = scheduler.get_job(f"alarm:{a.id}")
         next_time = job.next_run_time.isoformat() if job and job.next_run_time else "—"
-        lines.append(f"<b>#{a.id}</b> {'✅' if a.enabled else '⏸️'} | every {a.interval_minutes} min | next: {next_time}\nmsg: {html_escape(a.message)}")
+        lines.append(
+            f"<b>#{a.id}</b> {'✅' if a.enabled else '⏸️'} | every {a.interval_minutes} min | next: <code>{html_escape(next_time)}</code>\n"
+            f"• last: <code>{a.last_trigger_utc.isoformat()}</code>\n"
+            f"• msg: {html_escape(a.message)}"
+        )
     await send_long_message(context.application, update.effective_chat.id, "\n\n".join(lines))
 
 @guard
 async def delete_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = update.message.text.strip().split()
     if len(parts) != 2 or not parts[1].isdigit():
-        await update.message.reply_text("Usage: /delete_alarm id", parse_mode=ParseMode.HTML); return
+        await update.message.reply_text("Usage: /delete_alarm id", parse_mode=ParseMode.HTML)
+        return
     alarm_id = int(parts[1])
     async with AsyncSessionLocal() as session:
         alarm = (await session.execute(select(Alarm).where(Alarm.id==alarm_id, Alarm.owner_telegram_id==update.effective_user.id))).scalar_one_or_none()
         if not alarm:
-            await update.message.reply_text("Not found.", parse_mode=ParseMode.HTML); return
+            await update.message.reply_text("Not found.", parse_mode=ParseMode.HTML)
+            return
         await session.delete(alarm); await session.commit()
     if scheduler.get_job(f"alarm:{alarm_id}"): scheduler.remove_job(f"alarm:{alarm_id}")
     await update.message.reply_text(f"🗑️ Deleted alarm #{alarm_id}.", parse_mode=ParseMode.HTML)
@@ -369,7 +378,8 @@ async def delete_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @guard
 async def enable_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = update.message.text.strip().split()
-    if len(parts)!=2 or not parts[1].isdigit(): await update.message.reply_text("Usage: /enable_alarm id", parse_mode=ParseMode.HTML); return
+    if len(parts)!=2 or not parts[1].isdigit():
+        await update.message.reply_text("Usage: /enable_alarm id", parse_mode=ParseMode.HTML); return
     alarm_id=int(parts[1])
     async with AsyncSessionLocal() as session:
         alarm=(await session.execute(select(Alarm).where(Alarm.id==alarm_id, Alarm.owner_telegram_id==update.effective_user.id))).scalar_one_or_none()
@@ -381,7 +391,8 @@ async def enable_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @guard
 async def disable_alarm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = update.message.text.strip().split()
-    if len(parts)!=2 or not parts[1].isdigit(): await update.message.reply_text("Usage: /disable_alarm id", parse_mode=ParseMode.HTML); return
+    if len(parts)!=2 or not parts[1].isdigit():
+        await update.message.reply_text("Usage: /disable_alarm id", parse_mode=ParseMode.HTML); return
     alarm_id=int(parts[1])
     async with AsyncSessionLocal() as session:
         alarm=(await session.execute(select(Alarm).where(Alarm.id==alarm_id, Alarm.owner_telegram_id==update.effective_user.id))).scalar_one_or_none()
@@ -416,7 +427,11 @@ async def list_endpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for e in rows:
         job=scheduler.get_job(f"endpoint:{e.id}")
         next_time=job.next_run_time.isoformat() if job and job.next_run_time else "—"
-        lines.append(f"<b>#{e.id}</b> {'✅' if e.enabled else '⏸️'} | every {e.interval_minutes} min | next: {next_time}\nURL: <code>{html_escape(e.url)}</code>")
+        lines.append(
+            f"<b>#{e.id}</b> {'✅' if e.enabled else '⏸️'} | every {e.interval_minutes} min | next: <code>{html_escape(next_time)}</code>\n"
+            f"• timeout={e.timeout_seconds}s | latency={e.latency_threshold_seconds}s\n"
+            f"• url: <code>{html_escape(e.url)}</code>"
+        )
     await send_long_message(context.application, update.effective_chat.id, "\n\n".join(lines))
 
 @guard
@@ -456,40 +471,58 @@ async def disable_endpoint(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"⏸️ Disabled endpoint #{ep_id}", parse_mode=ParseMode.HTML)
 
 # -------------------------
-# App builder
+# Global error handler
 # -------------------------
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.exception("Unhandled error", exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.effective_user and is_allowed(update.effective_user.id):
+            await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ An internal error occurred. Check server logs.")
+    except Exception:
+        pass
+
+# -------------------------
+# App bootstrap
+# -------------------------
+
+async def on_start(app: Application):
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    scheduler.start()
+    await load_and_schedule_all(app)
+    log.info("TeleWatch started.")
+
 def build_app() -> Application:
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(on_start).build()
+
+    # Core
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("status", status_cmd))
+
+    # Alarms
     app.add_handler(CommandHandler("add_alarm", add_alarm))
     app.add_handler(CommandHandler("list_alarms", list_alarms))
     app.add_handler(CommandHandler("delete_alarm", delete_alarm))
     app.add_handler(CommandHandler("enable_alarm", enable_alarm))
     app.add_handler(CommandHandler("disable_alarm", disable_alarm))
+
+    # Endpoints
     app.add_handler(CommandHandler("add_endpoint", add_endpoint))
     app.add_handler(CommandHandler("list_endpoints", list_endpoints))
     app.add_handler(CommandHandler("delete_endpoint", delete_endpoint))
     app.add_handler(CommandHandler("enable_endpoint", enable_endpoint))
     app.add_handler(CommandHandler("disable_endpoint", disable_endpoint))
-    app.add_handler(MessageHandler(filters.COMMAND, start))  # fallback
+
+    # Fallback: any non-command text shows help
+    app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), start))
+
+    app.add_error_handler(error_handler)
     return app
 
-# -------------------------
-# Main
-# -------------------------
-
-async def async_main():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    scheduler.start()
-    app = build_app()
-    await load_and_schedule_all(app)
-    log.info("TeleWatch started.")
-    await app.run_polling()
-
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(async_main())
+    application = build_app()
+    # Important: no asyncio.run here; let PTB manage the loop
+    application.run_polling(close_loop=False)
