@@ -1,0 +1,17 @@
+[Unit]
+Description=TeleWatch personal bot
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/telewatch
+ExecStart=/path/to/telewatch/.venv/bin/python /path/to/telewatch/main.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+# Optional: environment file if you prefer not to use .env
+# EnvironmentFile=/path/to/telewatch/telewatch.env
+
+[Install]
+WantedBy=multi-user.target
